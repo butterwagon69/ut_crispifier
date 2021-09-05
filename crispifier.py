@@ -4,6 +4,7 @@ import sqlite3
 import glob
 import os.path
 from hashlib import sha256
+from io import BytesIO
 
 sys.path.append("./ESRGAN")
 from ESRGAN import architecture as arch
@@ -35,12 +36,15 @@ def get_palette_array(obj):
     ).astype(np.uint8)
 
 
-def get_model(path):
+def get_model_model_hash(path):
     model = arch.RRDB_Net(3, 3, 64, 23, gc=32)
     model.load_state_dict(torch.load(path))
     model.eval()
     model = model.to(torch.device("cpu"))
-    return model
+    hash = sha256()
+    with open(path, "rb") as f:
+        hash.update(f.read())
+    return model, hash.digest().hex()
 
 
 def get_named_object(name, construct):
@@ -81,41 +85,46 @@ def get_output_array(output):
     )
 
 
-def get_upscaled_from_db(image, cursor):
+def get_upscaled_from_db(image, model_hash, cursor):
     image_hash = hash_image(image)
-    results = list(
-        cursor.execute(
+    results = cursor.execute(
             """SELECT
-                width,
-                height,
-                texture_file
+                output_data
             FROM
-                textures
+                outputs
             WHERE
                 image_hash = ?
+                AND model_hash = ?
             """,
-            (image_hash,),
-        ).fetchall()
-    )
+            (image_hash, model_hash),
+        ).fetchone()
     i = results[0]
-    return Image.frombytes("RGB", i[:2], i[-1])
+    return Image.open(BytesIO(i))
 
 
-def put_upscaled_in_db(image, upscaled, name, cursor):
+def put_upscaled_in_db(image, upscaled, name, model_hash, cursor):
     image_hash = hash_image(image)
+    stream = BytesIO()
+    image.save(stream, "png")
+    stream.seek(0)
     cursor.execute(
-        """INSERT INTO textures
-            (image_hash, image_name, width, height, texture_file)
+        """INSERT OR IGNORE INTO 
+            inputs(image_hash, image_name, input_data)
         VALUES
-            (:image_hash, :name, :width, :height, :texture)
+            (:image_hash, :name, :image_file)
         """,
-        dict(
-            image_hash=image_hash,
-            name=name,
-            width=upscaled.width,
-            height=upscaled.height,
-            texture=upscaled.tobytes(),
-        ),
+        dict(image_hash=image_hash, name=name, image_file=stream.read(),),
+    )
+    stream = BytesIO()
+    upscaled.save(stream, "png")
+    stream.seek(0)
+    cursor.execute(
+        """INSERT OR IGNORE INTO
+            outputs(model_hash, image_hash, output_data)
+        VALUES
+            (:model_hash, :image_hash, :output_data)
+        """,
+        dict(model_hash=model_hash, image_hash=image_hash, output_data=stream.read(),),
     )
 
 
@@ -127,7 +136,9 @@ def upscale_image_gan(image, model, device):
         return Image.fromarray(output_array)
 
 
-def upscale_image(image, name, model, device, factor, db_filename=None):
+def upscale_image(
+    image, name, model, device, factor, db_filename=None, model_hash=None
+):
     """
         image: a PIL Image
         name: the name of the image
@@ -142,10 +153,10 @@ def upscale_image(image, name, model, device, factor, db_filename=None):
         with sqlite3.connect(db_filename) as conn:
             cursor = conn.cursor()
             try:
-                upscaled = get_upscaled_from_db(image, cursor)
-            except IndexError:
+                upscaled = get_upscaled_from_db(image, model_hash, cursor)
+            except (IndexError, TypeError):
                 upscaled = upscale_image_gan(image, model, device)
-                put_upscaled_in_db(image, upscaled, name, cursor)
+                put_upscaled_in_db(image, upscaled, name, model_hash, cursor)
         conn.close()
     return upscaled.resize((image.width * factor, image.height * factor))
 
@@ -254,13 +265,20 @@ def get_upscaled_texture(
     grow=3,
     shrink=3,
     threshold=128,
+    model_hash=None,
 ):
     palette_array = get_palette(obj, package)
     image_array = get_image_array(obj)
     image = get_image(image_array, palette_array)
     palettized_image = palettize(image, palette_array)
     upscaled = upscale_image(
-        image, obj.obj_name, model, device, factor, db_filename=db_filename
+        image,
+        obj.obj_name,
+        model,
+        device,
+        factor,
+        db_filename=db_filename,
+        model_hash=model_hash,
     )
     palettized_upscaled = palettize(upscaled, palette_array)
     try:
@@ -278,11 +296,13 @@ def rescale_package(
     model,
     device,
     factor,
+    model_hash,
     db_filename=None,
     blur=4,
     grow=3,
     shrink=3,
     threshold=128,
+    
 ):
     offset = 0
     for obj, header in zip(package.export_objects, package.export_headers):
@@ -307,6 +327,7 @@ def rescale_package(
                 grow=grow,
                 shrink=shrink,
                 threshold=threshold,
+                model_hash=model_hash,
             )
             mipmaps = generate_mipmaps(upscaled, start_pos=mipmap_shift)
             new_length = get_mipmap_length(mipmaps)
