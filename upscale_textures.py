@@ -42,9 +42,8 @@ if __name__ == "__main__":
             except BaseException as e:
                 print(e)
                 break
-            for _, texture in zip(
-                range(3),
-                (obj for obj in package.export_objects if obj.cls_name == "Texture"),
+            for _, texture in (
+                    obj for obj in package.export_objects if obj.cls_name == "Texture"
             ):
                 try:
                     image = crispifier.get_image(
@@ -91,7 +90,7 @@ if __name__ == "__main__":
                 )
                 crispifier.put_mipmap_palette_db(image_arrays, palette_array, cursor)
                 for model, model_hash in models_hashes:
-                    i = crispifier.upscale_image(
+                    crispifier.upscale_image(
                         image,
                         image_name,
                         model,
@@ -100,4 +99,4 @@ if __name__ == "__main__":
                         cursor,
                         model_hash=model_hash,
                     )
-            break
+                print(f"Upscaled {image_name} from {resource_path.name}")
