@@ -17,14 +17,18 @@ import numpy as np
 from PIL import Image, ImageTransform, ImageFilter
 
 
+class ImageNotFoundException(ValueError):
+    pass
+
+
 def hash_image(image):
     sha = sha256()
     sha.update(image.tobytes())
     return sha.digest().hex()
 
 
-def get_image_array(obj):
-    img = obj.object.img_data[0]
+def get_image_array(obj, mipmap_index=0):
+    img = obj.object.img_data[mipmap_index]
     width = img.width
     height = img.height
     return np.array(list(img.imgbytes)).reshape(height, width).astype(np.uint8)
@@ -85,20 +89,39 @@ def get_output_array(output):
     )
 
 
-def get_upscaled_from_db(image, model_hash, cursor):
+def get_upscaled_from_db(image, cursor, model_hash=None):
     image_hash = hash_image(image)
-    results = cursor.execute(
+    if model_hash is None:
+        results = cursor.execute(
             """SELECT
                 output_data
             FROM
                 outputs
+            JOIN
+                preferences
+            ON
+                outputs.image_hash = preferences.image_hash
             WHERE
-                image_hash = ?
-                AND model_hash = ?
+                outputs.image_hash = ?
             """,
+            (image_hash,),
+        ).fetchone()
+    else:
+        results = cursor.execute(
+            """SELECT
+                    output_data
+                FROM
+                    outputs
+                WHERE
+                    image_hash = ?
+                    AND model_hash = ?
+                """,
             (image_hash, model_hash),
         ).fetchone()
-    i = results[0]
+    try:
+        i = results[0]
+    except TypeError:
+        raise ImageNotFoundException("No output found for image!")
     return Image.open(BytesIO(i))
 
 
@@ -113,7 +136,11 @@ def put_upscaled_in_db(image, upscaled, name, model_hash, cursor):
         VALUES
             (:image_hash, :name, :image_file)
         """,
-        dict(image_hash=image_hash, name=name, image_file=stream.read(),),
+        dict(
+            image_hash=image_hash,
+            name=name,
+            image_file=stream.read(),
+        ),
     )
     stream = BytesIO()
     upscaled.save(stream, "png")
@@ -124,8 +151,50 @@ def put_upscaled_in_db(image, upscaled, name, model_hash, cursor):
         VALUES
             (:model_hash, :image_hash, :output_data)
         """,
-        dict(model_hash=model_hash, image_hash=image_hash, output_data=stream.read(),),
+        dict(
+            model_hash=model_hash,
+            image_hash=image_hash,
+            output_data=stream.read(),
+        ),
     )
+
+
+def put_mipmap_palette_db(mipmaps, palette_array, cursor):
+    palette_hash = hash_palette(palette_array)
+    cursor.execute(
+        """INSERT OR IGNORE INTO palettes
+        (palette_hash, palette_data)
+        VALUES (:palette_hash, :palette_data)
+        """,
+        dict(palette_hash=palette_hash, palette_data=palette_array.tobytes()),
+    )
+    image = get_image(mipmaps[0], palette_array)
+    image_hash = hash_image(image)
+    for mipmap_index, mipmap in enumerate(mipmaps):
+        cursor.execute(
+            """INSERT OR IGNORE INTO mipmaps
+            (image_hash, mipmap_index, mipmap_data)
+            VALUES (:image_hash, :mipmap_index, :mipmap_data)
+            """,
+            dict(
+                image_hash=image_hash,
+                mipmap_index=mipmap_index,
+                mipmap_data=mipmap.tobytes(),
+            ),
+        )
+    cursor.execute(
+        """INSERT OR IGNORE INTO palette_uses
+        (image_hash, palette_hash)
+        VALUES (:image_hash, :palette_hash) 
+        """,
+        dict(image_hash=image_hash, palette_hash=palette_hash),
+    )
+
+
+def hash_palette(palette):
+    sha = sha256()
+    sha.update(palette.tobytes())
+    return sha.digest().hex()
 
 
 def upscale_image_gan(image, model, device):
@@ -136,29 +205,21 @@ def upscale_image_gan(image, model, device):
         return Image.fromarray(output_array)
 
 
-def upscale_image(
-    image, name, model, device, factor, db_filename=None, model_hash=None
-):
+def upscale_image(image, name, model, device, factor, cursor, model_hash=None):
     """
-        image: a PIL Image
-        name: the name of the image
-        model: a torch GAN model for upscaling
-        device: a torch device
-        factor: the scale factor of the image
-        db_filename: optional path for a cached sqlite database of upscaled images
+    image: a PIL Image
+    name: the name of the image
+    model: a torch GAN model for upscaling
+    device: a torch device
+    factor: the scale factor of the image
+    cursor: database cursor for image database
     """
-    if db_filename is None:
+    try:
+        upscaled = get_upscaled_from_db(image, cursor, model_hash=model_hash)
+    except (ImageNotFoundException):
         upscaled = upscale_image_gan(image, model, device)
-    else:
-        with sqlite3.connect(db_filename) as conn:
-            cursor = conn.cursor()
-            try:
-                upscaled = get_upscaled_from_db(image, model_hash, cursor)
-            except (IndexError, TypeError):
-                upscaled = upscale_image_gan(image, model, device)
-                put_upscaled_in_db(image, upscaled, name, model_hash, cursor)
-        conn.close()
-    return upscaled.resize((image.width * factor, image.height * factor))
+        put_upscaled_in_db(image, upscaled, name, model_hash, cursor)
+    return upscaled.resize((int(image.width * factor), int(image.height * factor)))
 
 
 def palettize(image, palette_array):
@@ -217,9 +278,12 @@ def scale_image_properties(props, scale_factor):
     for property in props:
         name = property.prop_name
         if name in ("UBits", "VBits"):
-            property.value.data += scale_factor.bit_length()
-        elif name in ("USize", "VSize", "UClamp", "VClamp"):
-            property.value.data *= scale_factor
+            property.value.data += scale_factor.bit_length() - 4
+        elif name in ("USize", "VSize"):
+            property.value.data *= 4 * scale_factor
+        elif name in ("UClamp", "VClamp"):
+            property.value.data *= 4 * scale_factor
+            pass
 
 
 def get_mask_index(palette_array):
@@ -232,7 +296,9 @@ def get_mask(palettized_image, mask_index):
 
 def scale_mask(mask_array, factor, blur=2, grow=3, shrink=3, threshold=100):
     mask_image = Image.fromarray(mask_array * np.uint8(255))
-    scaled = mask_image.resize((mask_image.width * factor, mask_image.height * factor))
+    scaled = mask_image.resize(
+        (int(mask_image.width * factor), int(mask_image.height * factor))
+    )
     return (
         np.array(
             scaled.filter(ImageFilter.GaussianBlur(blur))
@@ -286,7 +352,42 @@ def get_upscaled_texture(
     except:
         mask_index = -1
     mask = get_mask(image_array, mask_index)
-    scaled_mask = scale_mask(mask, factor, blur=4, grow=3, shrink=3, threshold=128)
+    scaled_mask = scale_mask(
+        mask, factor, blur=blur, grow=grow, shrink=shrink, threshold=threshold
+    )
+    mask_image(palettized_upscaled, scaled_mask, mask_index)
+    return palettized_upscaled
+
+
+def get_upscaled_texture_db(
+    package,
+    obj,
+    factor,
+    db_filename,
+    blur=4,
+    grow=3,
+    shrink=3,
+    threshold=128,
+    model_hash=None,
+):
+    palette_array = get_palette(obj, package)
+    image_array = get_image_array(obj)
+    image = get_image(image_array, palette_array)
+    palettized_image = palettize(image, palette_array)
+    with sqlite3.connect(db_filename) as conn:
+        cursor = conn.cursor()
+        upscaled = get_upscaled_from_db(
+            image, conn.cursor(), model_hash=model_hash
+        ).resize((int(image.width * factor), int(image.height * factor)))
+    palettized_upscaled = palettize(upscaled, palette_array)
+    try:
+        mask_index = get_mask_index(palette_array)
+    except:
+        mask_index = -1
+    mask = get_mask(image_array, mask_index)
+    scaled_mask = scale_mask(
+        mask, factor, blur=blur, grow=grow, shrink=shrink, threshold=threshold
+    )
     mask_image(palettized_upscaled, scaled_mask, mask_index)
     return palettized_upscaled
 
@@ -302,7 +403,6 @@ def rescale_package(
     grow=3,
     shrink=3,
     threshold=128,
-    
 ):
     offset = 0
     for obj, header in zip(package.export_objects, package.export_headers):
@@ -340,6 +440,69 @@ def rescale_package(
                 mipmap_subcon.parse(mipmap_subcon.build(mipmap)) for mipmap in mipmaps
             ]
             scale_image_properties(obj.object.property, factor)
+        elif obj.cls_name.lower() in {"lodmesh", "mesh"}:
+            obj.object.pos0 += offset
+            obj.object.pos1 += offset
+            obj.object.pos2 += offset
+            obj.object.pos3 += offset
+    package.header.export_offset += offset
+    package.header.import_offset += offset
+
+
+def rescale_package_db(
+    package,
+    factor,
+    db_filename,
+    blur=4,
+    grow=3,
+    shrink=3,
+    threshold=128,
+    model_hash=None,
+):
+    """Rescales textures in a package from a source db"""
+    offset = 0
+    for obj, header in zip(package.export_objects, package.export_headers):
+        header.serial_offset += offset
+        obj.serial_offset += offset
+        if obj.cls_name == "Texture":
+            if obj.obj_name.startswith("FlatFXTex"):
+                local_factor = 1
+            else:
+                local_factor = factor
+            mipmap_shift = (
+                obj.object.img_data[0].pos_after
+                - obj.object.img_data[0].block_size
+                - len(idx.build(obj.object.img_data[0].block_size))
+                + offset
+            )
+
+            original_length = get_mipmap_length(obj.object.img_data)
+            try:
+                upscaled = get_upscaled_texture_db(
+                    package,
+                    obj,
+                    local_factor,
+                    db_filename,
+                    blur=blur,
+                    grow=grow,
+                    shrink=shrink,
+                    threshold=threshold,
+                    model_hash=model_hash,
+                )
+                print("Found image!")
+            except ImageNotFoundException:
+                continue
+            mipmaps = generate_mipmaps(upscaled, start_pos=mipmap_shift)
+            new_length = get_mipmap_length(mipmaps)
+            delta = new_length - original_length
+            offset += delta
+            obj.serial_size += delta
+            header.serial_size += delta
+            obj.object.mip_map_count = len(mipmaps)
+            obj.object.img_data = [
+                mipmap_subcon.parse(mipmap_subcon.build(mipmap)) for mipmap in mipmaps
+            ]
+            scale_image_properties(obj.object.property, local_factor)
         elif obj.cls_name.lower() in {"lodmesh", "mesh"}:
             obj.object.pos0 += offset
             obj.object.pos1 += offset
