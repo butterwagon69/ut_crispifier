@@ -42,7 +42,7 @@ if __name__ == "__main__":
             except BaseException as e:
                 print(e)
                 break
-            for _, texture in (
+            for texture in (
                     obj for obj in package.export_objects if obj.cls_name == "Texture"
             ):
                 try:
