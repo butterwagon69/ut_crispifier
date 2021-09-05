@@ -1,0 +1,16 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "*"
+numpy = "*"
+ut-parser = {editable = true, ref = "ac7d", git = "https://github.com/butterwagon69/ut_parser.git"}
+construct = "*"
+pillow = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.9"
