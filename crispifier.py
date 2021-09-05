@@ -489,7 +489,6 @@ def rescale_package_db(
                     threshold=threshold,
                     model_hash=model_hash,
                 )
-                print("Found image!")
             except ImageNotFoundException:
                 continue
             mipmaps = generate_mipmaps(upscaled, start_pos=mipmap_shift)
