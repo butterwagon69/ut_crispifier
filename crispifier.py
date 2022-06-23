@@ -5,6 +5,9 @@ import glob
 import os.path
 from hashlib import sha256
 from io import BytesIO
+from sqlalchemy import select
+from sqlalchemy.sql import and_
+from orm import Input, Output, Preference
 
 sys.path.append("./ESRGAN")
 from ESRGAN import architecture as arch
@@ -87,6 +90,26 @@ def get_output_array(output):
         .round()
         .astype(np.uint8)
     )
+
+def get_upscaled_from_orm(image, session, model_hash=None):
+    image_hash = hash_image(image)
+    if model_hash is None:
+        stmt = select(
+            Preference
+        ).where(Preference.image_hash == image_hash)
+        pref, = session.execute(stmt).one()
+        out = pref.output
+    else:
+        stmt = select(
+            Output
+        ).where(
+            and_(
+                Output.image_hash == image_hash,
+                Output.model_hash == model_hash,
+            )
+        )
+        out, = session.execute(stmt).one()
+    return Image.open(BytesIO(out.output_data))
 
 
 def get_upscaled_from_db(image, cursor, model_hash=None):
